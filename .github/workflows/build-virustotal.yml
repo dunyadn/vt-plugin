@@ -1,0 +1,409 @@
+name: Build VirusTotal Scanner
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+      - name: Write plugin files
+        run: |
+          D=plugins/virustotal-scanner
+          mkdir -p $D/js
+          cat > $D/manifest.json <<'VTEOF'
+          {
+              "format": 1,
+              "id": "com.valenced.virustotal-scanner",
+              "name": "VirusTotal Scanner",
+              "description": "Mesaj veya bağlantılara basılı tutarak VirusTotal ile güvenlik taraması yapın.",
+              "author": "Developer",
+              "version": "1.0.1",
+              "dependencies": {
+                  "valenced.api": { "version": ">=1 <2" },
+                  "discord": { "version": "*" }
+              },
+              "dist": {
+                  "script": "index.js"
+              }
+          }
+          VTEOF
+          cat > $D/tsconfig.json <<'VTEOF'
+          { "extends": "../../tsconfig.base.json" }
+          VTEOF
+          cat > $D/js/index.ts <<'VTEOF'
+          import { ActionSheetActionCreators } from '@valenced/discord/actions'
+          import { Design } from '@valenced/discord/design'
+          import { after, before } from '@valenced/patcher'
+          import { createElement } from 'react'
+          import { showAlert } from './alert'
+          import Settings, { type Stored } from './Settings'
+          import { T } from './strings'
+          import { scanUrl } from './virustotal'
+
+          const URL_RE = /https?:\/\/[^\s<>"')\]]+/gi
+          const ROW_KEY = 'valenced-vt-scan'
+
+          function collectUrls(props: any): string[] {
+              const out: string[] = []
+              const add = (u: unknown) => typeof u === 'string' && /^https?:\/\//i.test(u) && out.push(u)
+              const msg = props?.message
+              add(props?.url)
+              add(props?.href)
+              add(props?.link)
+              if (msg) {
+                  if (typeof msg.content === 'string') (msg.content.match(URL_RE) ?? []).forEach(add)
+                  for (const a of msg.attachments ?? []) add(a?.url ?? a?.proxy_url)
+                  for (const e of msg.embeds ?? []) add(e?.url)
+              }
+              return [...new Set(out)].slice(0, 3)
+          }
+
+          const isRow = (k: any) => k?.props && k.props.onPress && k.props.label != null
+
+          function findRows(n: any, depth = 0): any[] | null {
+              if (!n || depth > 12) return null
+              if (Array.isArray(n)) {
+                  if (n.some(isRow)) return n
+                  for (const k of n) {
+                      const r = findRows(k, depth + 1)
+                      if (r) return r
+                  }
+                  return null
+              }
+              return typeof n === 'object' && n.props ? findRows(n.props.children, depth + 1) : null
+          }
+
+          export default plugin<{ jsonStorage: Stored }>({
+              jsonStorage: { load: true, default: { apiKey: '' } },
+
+              start({ cleanup, jsonStorage }) {
+                  let busy = false
+                  const patched = new WeakSet<object>()
+
+                  const run = async (url: string, sheetKey: string) => {
+                      if (busy) return
+                      busy = true
+                      try {
+                          try {
+                              ActionSheetActionCreators.hideActionSheet(sheetKey)
+                          } catch {}
+                          const key = jsonStorage.cache?.apiKey ?? (await jsonStorage.get())?.apiKey
+                          if (!key) return showAlert('VirusTotal', T.needKey, T.ok)
+
+                          const r = await scanUrl(url, key)
+                          if (r.kind === 'error')
+                              return showAlert('VirusTotal', T.err[r.code] || r.message, T.ok)
+                          if (r.kind === 'submitted')
+                              return showAlert('VirusTotal', T.submitted, T.ok, T.report, r.reportUrl)
+
+                          const s = r.stats
+                          const head = r.flagged === 0 ? T.clean(r.total) : T.threat(r.flagged, r.total)
+                          const detail = `malicious: ${s.malicious} · suspicious: ${s.suspicious} · harmless: ${s.harmless} · undetected: ${s.undetected}`
+                          showAlert('VirusTotal', `${head}\n\n${detail}`, T.ok, T.report, r.reportUrl)
+                      } finally {
+                          busy = false
+                      }
+                  }
+
+                  cleanup(
+                      before(ActionSheetActionCreators as any, 'openLazy', (args: any[]) => {
+                          try {
+                              const [lazy, sheetKey] = args
+                              if (typeof sheetKey !== 'string' || !/LongPress/i.test(sheetKey)) return args
+                              Promise.resolve(lazy).then((mod: any) => {
+                                  if (!mod || typeof mod.default !== 'function' || patched.has(mod)) return
+                                  patched.add(mod)
+                                  cleanup(
+                                      after(mod, 'default', (cArgs: any[], ret: any) => {
+                                          try {
+                                              const urls = collectUrls(cArgs?.[0])
+                                              if (!urls.length) return ret
+                                              const rows = findRows(ret)
+                                              if (!rows || rows.some((k: any) => String(k?.key ?? '').startsWith(ROW_KEY))) return ret
+                                              const { ActionSheetRow } = Design as any
+                                              urls.forEach((u, i) =>
+                                                  rows.push(
+                                                      createElement(ActionSheetRow, {
+                                                          key: `${ROW_KEY}-${i}`,
+                                                          label: urls.length > 1 ? `${T.scan} (${i + 1})` : T.scan,
+                                                          onPress: () => run(u, sheetKey),
+                                                      }),
+                                                  ),
+                                              )
+                                          } catch {}
+                                          return ret
+                                      }),
+                                  )
+                              })
+                          } catch {}
+                          return args
+                      }),
+                  )
+              },
+
+              SettingsComponent: Settings,
+          })
+          VTEOF
+          cat > $D/js/Settings.tsx <<'VTEOF'
+          import { Design } from '@valenced/discord/design'
+          import { useState } from 'react'
+          import { showAlert } from './alert'
+          import { T } from './strings'
+
+          export interface Stored {
+              apiKey: string
+          }
+
+          export default function Settings({ api }: { api: { jsonStorage: any } }) {
+              const { Stack, Text, TextInput, Button, TableRowGroup } = Design as any
+              const storage = api.jsonStorage
+              const stored = storage.use() as Stored | undefined
+              const [draft, setDraft] = useState('')
+              const hasKey = !!stored?.apiKey
+
+              const save = async () => {
+                  const v = draft.trim()
+                  if (!/^[A-Za-z0-9]{32,128}$/.test(v)) return showAlert(T.title, T.invalidKey, T.ok)
+                  await storage.set({ apiKey: v })
+                  setDraft('')
+                  showAlert(T.title, T.saved, T.ok)
+              }
+              const remove = async () => {
+                  await storage.set({ apiKey: '' })
+                  showAlert(T.title, T.removed, T.ok)
+              }
+
+              return (
+                  <TableRowGroup title={T.title}>
+                      <Stack spacing={12} style={{ padding: 16 }}>
+                          <Text variant="text-sm/medium" color="text-muted">
+                              {T.help}
+                          </Text>
+                          <Text variant="text-md/semibold">{hasKey ? T.keySet : T.keyMissing}</Text>
+                          <TextInput
+                              value={draft}
+                              onChange={setDraft}
+                              onChangeText={setDraft}
+                              placeholder={T.placeholder}
+                              secureTextEntry
+                              isMasked
+                              autoCapitalize="none"
+                              autoCorrect={false}
+                          />
+                          <Button text={T.save} variant="primary" onPress={save} />
+                          {hasKey && <Button text={T.remove} variant="destructive" onPress={remove} />}
+                      </Stack>
+                  </TableRowGroup>
+              )
+          }
+          VTEOF
+          cat > $D/js/alert.tsx <<'VTEOF'
+          import { AlertActionCreators } from '@valenced/discord/actions'
+          import { Design } from '@valenced/discord/design'
+          import { Linking } from 'react-native'
+
+          export function showAlert(title: string, content: string, okText: string, reportText?: string, reportUrl?: string) {
+              const { AlertModal, AlertActionButton } = Design as any
+              AlertActionCreators.openAlert(
+                  'valenced-virustotal-alert',
+                  <AlertModal
+                      title={title}
+                      content={content}
+                      actions={
+                          <>
+                              {reportUrl && (
+                                  <AlertActionButton
+                                      text={reportText}
+                                      variant="primary"
+                                      onPress={() => Linking.openURL(reportUrl)}
+                                  />
+                              )}
+                              <AlertActionButton text={okText} variant="secondary" />
+                          </>
+                      }
+                  />,
+              )
+          }
+          VTEOF
+          cat > $D/js/strings.ts <<'VTEOF'
+          const tr = {
+              scan: 'VirusTotal ile Tara',
+              title: 'VirusTotal API Anahtarı',
+              help: "Anahtarın yalnızca bu cihazda saklanır ve sadece virustotal.com'a gönderilir.",
+              keySet: '✅ Anahtar kayıtlı',
+              keyMissing: '⚠️ Henüz anahtar girilmedi',
+              placeholder: 'VirusTotal API anahtarı',
+              save: 'Kaydet',
+              remove: 'Anahtarı Sil',
+              saved: 'API anahtarı bu cihaza kaydedildi.',
+              removed: 'API anahtarı silindi.',
+              invalidKey: 'Geçersiz anahtar biçimi.',
+              needKey: 'Önce eklenti ayarlarından VirusTotal API anahtarını girin.',
+              report: 'Raporu Aç',
+              ok: 'Tamam',
+              scanning: 'Taranıyor…',
+              clean: (t: number) => `✅ Temiz (${t} güvenlik sağlayıcısından 0'ı bu bağlantıyı işaretledi)`,
+              threat: (f: number, t: number) => `⚠️ Zararlı tespit: ${t} sağlayıcıdan ${f}'i bunu işaretledi!`,
+              submitted: '🔍 Bu bağlantı daha önce taranmamıştı. Analiz başlatıldı; bir dakika sonra tekrar deneyin.',
+              err: {
+                  NO_KEY: '',
+                  BAD_URL: 'Geçerli bir bağlantı bulunamadı.',
+                  BAD_KEY: 'VirusTotal API anahtarını reddetti.',
+                  RATE_LIMIT: 'İstek sınırına ulaşıldı, biraz sonra tekrar deneyin.',
+                  NETWORK: 'Ağ hatası.',
+                  HTTP: 'VirusTotal hata döndürdü.',
+              } as Record<string, string>,
+          }
+
+          const en = {
+              scan: 'Scan with VirusTotal',
+              title: 'VirusTotal API Key',
+              help: 'Your key is stored only on this device and sent only to virustotal.com.',
+              keySet: '✅ Key saved',
+              keyMissing: '⚠️ No key set yet',
+              placeholder: 'VirusTotal API key',
+              save: 'Save',
+              remove: 'Remove key',
+              saved: 'API key saved on this device.',
+              removed: 'API key removed.',
+              invalidKey: 'Invalid key format.',
+              needKey: 'Enter your VirusTotal API key in the plugin settings first.',
+              report: 'Open Report',
+              ok: 'OK',
+              scanning: 'Scanning…',
+              clean: (t: number) => `✅ Clean (0/${t} security vendors flagged this link)`,
+              threat: (f: number, t: number) => `⚠️ Malicious Detections: ${f}/${t} vendors flagged this!`,
+              submitted: "🔍 This link hadn't been scanned yet. Analysis has started; try again in a minute.",
+              err: {
+                  NO_KEY: '',
+                  BAD_URL: 'No valid link found.',
+                  BAD_KEY: 'VirusTotal rejected the API key.',
+                  RATE_LIMIT: 'Rate limit reached, try again shortly.',
+                  NETWORK: 'Network error.',
+                  HTTP: 'VirusTotal returned an error.',
+              } as Record<string, string>,
+          }
+
+          let locale = 'en'
+          try {
+              locale = Intl.DateTimeFormat().resolvedOptions().locale.toLowerCase()
+          } catch {}
+
+          export const T = locale.startsWith('tr') ? tr : en
+          VTEOF
+          cat > $D/js/virustotal.ts <<'VTEOF'
+          const API = 'https://www.virustotal.com/api/v3'
+          const GUI = 'https://www.virustotal.com/gui/url'
+
+          export interface Stats {
+              malicious: number
+              suspicious: number
+              harmless: number
+              undetected: number
+              timeout: number
+          }
+
+          export type ScanResult =
+              | { kind: 'report'; stats: Stats; flagged: number; total: number; reportUrl: string }
+              | { kind: 'submitted'; reportUrl: string }
+              | { kind: 'error'; code: 'NO_KEY' | 'BAD_URL' | 'BAD_KEY' | 'RATE_LIMIT' | 'NETWORK' | 'HTTP'; message: string }
+
+          const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+
+          /** URL-safe base64 without padding (the identifier VirusTotal v3 expects). */
+          export function urlId(url: string): string {
+              const s = unescape(encodeURIComponent(url))
+              let out = ''
+              for (let i = 0; i < s.length; i += 3) {
+                  const a = s.charCodeAt(i)
+                  const b = i + 1 < s.length ? s.charCodeAt(i + 1) : 0
+                  const c = i + 2 < s.length ? s.charCodeAt(i + 2) : 0
+                  const n = (a << 16) | (b << 8) | c
+                  out += B64[(n >> 18) & 63] + B64[(n >> 12) & 63]
+                  if (i + 1 < s.length) out += B64[(n >> 6) & 63]
+                  if (i + 2 < s.length) out += B64[n & 63]
+              }
+              return out
+          }
+
+          const num = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0)
+
+          function parseStats(json: any): Stats | null {
+              const s = json?.data?.attributes?.last_analysis_stats
+              if (!s || typeof s !== 'object') return null
+              return {
+                  malicious: num(s.malicious),
+                  suspicious: num(s.suspicious),
+                  harmless: num(s.harmless),
+                  undetected: num(s.undetected),
+                  timeout: num(s.timeout),
+              }
+          }
+
+          // The key is only ever placed in the x-apikey header of requests to virustotal.com.
+          function vt(path: string, key: string, init: RequestInit = {}) {
+              return fetch(`${API}${path}`, {
+                  ...init,
+                  headers: { accept: 'application/json', ...(init.headers as any), 'x-apikey': key },
+              })
+          }
+
+          function httpError(status: number): ScanResult {
+              if (status === 401 || status === 403)
+                  return { kind: 'error', code: 'BAD_KEY', message: 'VirusTotal rejected the API key.' }
+              if (status === 429)
+                  return { kind: 'error', code: 'RATE_LIMIT', message: 'VirusTotal rate limit reached.' }
+              return { kind: 'error', code: 'HTTP', message: `VirusTotal returned HTTP ${status}.` }
+          }
+
+          export async function scanUrl(rawUrl: string, apiKey: string | undefined | null): Promise<ScanResult> {
+              const key = (apiKey ?? '').trim()
+              if (!key) return { kind: 'error', code: 'NO_KEY', message: 'No API key configured.' }
+
+              const url = rawUrl.trim()
+              if (!/^https?:\/\/[^\s]+$/i.test(url))
+                  return { kind: 'error', code: 'BAD_URL', message: 'Not a valid http(s) link.' }
+
+              const id = urlId(url)
+              const reportUrl = `${GUI}/${id}`
+
+              try {
+                  const res = await vt(`/urls/${id}`, key)
+
+                  if (res.status === 404) {
+                      const post = await vt('/urls', key, {
+                          method: 'POST',
+                          headers: { 'content-type': 'application/x-www-form-urlencoded' },
+                          body: `url=${encodeURIComponent(url)}`,
+                      })
+                      return post.ok ? { kind: 'submitted', reportUrl } : httpError(post.status)
+                  }
+                  if (!res.ok) return httpError(res.status)
+
+                  const stats = parseStats(await res.json())
+                  if (!stats) return { kind: 'submitted', reportUrl }
+
+                  const total = stats.malicious + stats.suspicious + stats.harmless + stats.undetected
+                  // All zeros = analysis still running.
+                  if (total === 0) return { kind: 'submitted', reportUrl }
+
+                  return { kind: 'report', stats, flagged: stats.malicious + stats.suspicious, total, reportUrl }
+              } catch {
+                  return { kind: 'error', code: 'NETWORK', message: 'Network error while contacting VirusTotal.' }
+              }
+          }
+          VTEOF
+      - run: bun run build virustotal-scanner
+      - name: Package
+        run: |
+          mkdir out
+          cp plugins/virustotal-scanner/manifest.json plugins/virustotal-scanner/build/js/index.js out/
+          cd out && zip -X ../com.valenced.virustotal-scanner@1.0.1.zip manifest.json index.js
+      - uses: actions/upload-artifact@v4
+        with:
+          name: virustotal-scanner
+          path: com.valenced.virustotal-scanner@1.0.1.zip
