@@ -21,7 +21,7 @@ jobs:
               "name": "VirusTotal Scanner",
               "description": "Mesaj veya bağlantılara basılı tutarak VirusTotal ile güvenlik taraması yapın.",
               "author": "Developer",
-              "version": "1.0.1",
+              "version": "1.0.2",
               "dependencies": {
                   "valenced.api": { "version": ">=1 <2" },
                   "discord": { "version": "*" }
@@ -56,32 +56,38 @@ jobs:
               add(props?.link)
               if (msg) {
                   if (typeof msg.content === 'string') (msg.content.match(URL_RE) ?? []).forEach(add)
-                  for (const a of msg.attachments ?? []) add(a?.url ?? a?.proxy_url)
-                  for (const e of msg.embeds ?? []) add(e?.url)
+                  for (const a of (msg.attachments ?? []).slice?.(0, 10) ?? []) add(a?.url ?? a?.proxy_url)
+                  for (const e of (msg.embeds ?? []).slice?.(0, 10) ?? []) add(e?.url)
               }
               return [...new Set(out)].slice(0, 3)
           }
 
           const isRow = (k: any) => k?.props && k.props.onPress && k.props.label != null
 
-          function findRows(n: any, depth = 0): any[] | null {
-              if (!n || depth > 12) return null
-              if (Array.isArray(n)) {
-                  if (n.some(isRow)) return n
-                  for (const k of n) {
-                      const r = findRows(k, depth + 1)
-                      if (r) return r
+          // Bounded search so a large/odd tree can never hang the UI thread.
+          function findRows(root: any): any[] | null {
+              let budget = 300
+              const walk = (n: any, depth: number): any[] | null => {
+                  if (!n || depth > 10 || budget-- <= 0) return null
+                  if (Array.isArray(n)) {
+                      if (n.some(isRow)) return n
+                      for (const k of n) {
+                          const r = walk(k, depth + 1)
+                          if (r) return r
+                      }
+                      return null
                   }
-                  return null
+                  return typeof n === 'object' && n.props ? walk(n.props.children, depth + 1) : null
               }
-              return typeof n === 'object' && n.props ? findRows(n.props.children, depth + 1) : null
+              return walk(root, 0)
           }
 
           export default plugin<{ jsonStorage: Stored }>({
-              jsonStorage: { load: true, default: { apiKey: '' } },
+              jsonStorage: { load: true, default: { apiKey: '', enabled: false } },
 
-              start({ cleanup, jsonStorage }) {
+              start({ cleanup, jsonStorage, logger }) {
                   let busy = false
+                  let unpatches: Array<() => void> = []
                   const patched = new WeakSet<object>()
 
                   const run = async (url: string, sheetKey: string) => {
@@ -95,10 +101,8 @@ jobs:
                           if (!key) return showAlert('VirusTotal', T.needKey, T.ok)
 
                           const r = await scanUrl(url, key)
-                          if (r.kind === 'error')
-                              return showAlert('VirusTotal', T.err[r.code] || r.message, T.ok)
-                          if (r.kind === 'submitted')
-                              return showAlert('VirusTotal', T.submitted, T.ok, T.report, r.reportUrl)
+                          if (r.kind === 'error') return showAlert('VirusTotal', T.err[r.code] || r.message, T.ok)
+                          if (r.kind === 'submitted') return showAlert('VirusTotal', T.submitted, T.ok, T.report, r.reportUrl)
 
                           const s = r.stats
                           const head = r.flagged === 0 ? T.clean(r.total) : T.threat(r.flagged, r.total)
@@ -109,39 +113,73 @@ jobs:
                       }
                   }
 
-                  cleanup(
-                      before(ActionSheetActionCreators as any, 'openLazy', (args: any[]) => {
-                          try {
-                              const [lazy, sheetKey] = args
-                              if (typeof sheetKey !== 'string' || !/LongPress/i.test(sheetKey)) return args
-                              Promise.resolve(lazy).then((mod: any) => {
-                                  if (!mod || typeof mod.default !== 'function' || patched.has(mod)) return
-                                  patched.add(mod)
-                                  cleanup(
-                                      after(mod, 'default', (cArgs: any[], ret: any) => {
+                  const install = () => {
+                      if (unpatches.length) return
+                      try {
+                          unpatches.push(
+                              before(ActionSheetActionCreators as any, 'openLazy', (args: any[]) => {
+                                  try {
+                                      const [lazy, sheetKey] = args
+                                      if (typeof sheetKey !== 'string' || !/LongPress/i.test(sheetKey)) return args
+                                      if (!lazy || typeof lazy.then !== 'function') return args
+                                      lazy.then((mod: any) => {
                                           try {
-                                              const urls = collectUrls(cArgs?.[0])
-                                              if (!urls.length) return ret
-                                              const rows = findRows(ret)
-                                              if (!rows || rows.some((k: any) => String(k?.key ?? '').startsWith(ROW_KEY))) return ret
-                                              const { ActionSheetRow } = Design as any
-                                              urls.forEach((u, i) =>
-                                                  rows.push(
-                                                      createElement(ActionSheetRow, {
-                                                          key: `${ROW_KEY}-${i}`,
-                                                          label: urls.length > 1 ? `${T.scan} (${i + 1})` : T.scan,
-                                                          onPress: () => run(u, sheetKey),
-                                                      }),
-                                                  ),
+                                              if (!unpatches.length) return
+                                              if (!mod || typeof mod.default !== 'function' || patched.has(mod)) return
+                                              patched.add(mod)
+                                              unpatches.push(
+                                                  after(mod, 'default', (cArgs: any[], ret: any) => {
+                                                      try {
+                                                          if (!jsonStorage.cache?.enabled) return ret
+                                                          const urls = collectUrls(cArgs?.[0])
+                                                          if (!urls.length) return ret
+                                                          const rows = findRows(ret)
+                                                          if (!rows || rows.some((k: any) => String(k?.key ?? '').startsWith(ROW_KEY)))
+                                                              return ret
+                                                          const { ActionSheetRow } = Design as any
+                                                          urls.forEach((u, i) =>
+                                                              rows.push(
+                                                                  createElement(ActionSheetRow, {
+                                                                      key: `${ROW_KEY}-${i}`,
+                                                                      label: urls.length > 1 ? `${T.scan} (${i + 1})` : T.scan,
+                                                                      onPress: () => run(u, sheetKey),
+                                                                  }),
+                                                              ),
+                                                          )
+                                                      } catch (e) {
+                                                          logger.log(`vt row error: ${e}`)
+                                                      }
+                                                      return ret
+                                                  }),
                                               )
-                                          } catch {}
-                                          return ret
-                                      }),
-                                  )
-                              })
+                                          } catch (e) {
+                                              logger.log(`vt patch error: ${e}`)
+                                          }
+                                      })
+                                  } catch (e) {
+                                      logger.log(`vt openLazy error: ${e}`)
+                                  }
+                                  return args
+                              }),
+                          )
+                      } catch (e) {
+                          logger.log(`vt install error: ${e}`)
+                      }
+                  }
+
+                  const uninstall = () => {
+                      for (const u of unpatches.splice(0)) {
+                          try {
+                              u()
                           } catch {}
-                          return args
-                      }),
+                      }
+                  }
+
+                  // Nothing is patched at startup unless the user turned the menu entry on.
+                  if (jsonStorage.cache?.enabled) install()
+                  cleanup(
+                      jsonStorage.subscribe(() => (jsonStorage.cache?.enabled ? install() : uninstall())),
+                      uninstall,
                   )
               },
 
@@ -156,10 +194,11 @@ jobs:
 
           export interface Stored {
               apiKey: string
+              enabled: boolean
           }
 
           export default function Settings({ api }: { api: { jsonStorage: any } }) {
-              const { Stack, Text, TextInput, Button, TableRowGroup } = Design as any
+              const { Stack, Text, TextInput, Button, TableRowGroup, TableSwitchRow } = Design as any
               const storage = api.jsonStorage
               const stored = storage.use() as Stored | undefined
               const [draft, setDraft] = useState('')
@@ -178,6 +217,15 @@ jobs:
               }
 
               return (
+                  <>
+                  <TableRowGroup title={T.menuToggle}>
+                      <TableSwitchRow
+                          label={T.menuToggle}
+                          subLabel={T.menuToggleHelp}
+                          value={stored?.enabled ?? false}
+                          onValueChange={(enabled: boolean) => storage.set({ enabled })}
+                      />
+                  </TableRowGroup>
                   <TableRowGroup title={T.title}>
                       <Stack spacing={12} style={{ padding: 16 }}>
                           <Text variant="text-sm/medium" color="text-muted">
@@ -198,6 +246,7 @@ jobs:
                           {hasKey && <Button text={T.remove} variant="destructive" onPress={remove} />}
                       </Stack>
                   </TableRowGroup>
+                  </>
               )
           }
           VTEOF
@@ -232,6 +281,8 @@ jobs:
           cat > $D/js/strings.ts <<'VTEOF'
           const tr = {
               scan: 'VirusTotal ile Tara',
+              menuToggle: 'Basılı tutma menüsüne ekle',
+              menuToggleHelp: 'Mesaj/bağlantıya basılı tutunca "VirusTotal ile Tara" seçeneğini gösterir. Sorun olursa kapatın.',
               title: 'VirusTotal API Anahtarı',
               help: "Anahtarın yalnızca bu cihazda saklanır ve sadece virustotal.com'a gönderilir.",
               keySet: '✅ Anahtar kayıtlı',
@@ -261,6 +312,8 @@ jobs:
 
           const en = {
               scan: 'Scan with VirusTotal',
+              menuToggle: 'Add to long-press menu',
+              menuToggleHelp: 'Shows "Scan with VirusTotal" when long-pressing a message or link. Turn off if anything misbehaves.',
               title: 'VirusTotal API Key',
               help: 'Your key is stored only on this device and sent only to virustotal.com.',
               keySet: '✅ Key saved',
@@ -402,7 +455,6 @@ jobs:
         run: |
           mkdir out
           cp plugins/virustotal-scanner/manifest.json plugins/virustotal-scanner/build/js/index.js out/
-          cd out && zip -X ../com.valenced.virustotal-scanner@1.0.1.zip manifest.json index.js
       - uses: actions/upload-artifact@v4
         with:
           name: virustotal-scanner
